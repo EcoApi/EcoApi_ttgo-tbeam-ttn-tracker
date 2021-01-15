@@ -90,7 +90,7 @@ void forceTxSingleChannelDr() {
     #endif
 
     // Set data rate (SF) and transmit power for uplink
-    ttn_sf(LORAWAN_SF);
+    ttn_sf(settings.sf);
 }
 
 
@@ -303,7 +303,7 @@ void ttn_join() {
         forceTxSingleChannelDr();
         #else
         // Set default rate and transmit power for uplink (note: txpow seems to be ignored by the library)
-        ttn_sf(LORAWAN_SF);
+        ttn_sf(settings.sf);
         #endif
 
     #if defined(USE_ABP)

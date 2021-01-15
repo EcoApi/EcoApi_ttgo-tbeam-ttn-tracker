@@ -25,6 +25,8 @@
 #include "rom/rtc.h"
 #include <TinyGPS++.h>
 #include <Wire.h>
+#include <Preferences.h>
+
 
 #ifdef T_BEAM_V10
 #include "axp20x.h"
@@ -50,11 +52,61 @@ bool packetSent, packetQueued;
 RTC_DATA_ATTR int bootCount = 0;
 esp_sleep_source_t wakeCause; // the reason we booted this time
 
+typedef
+
+
+//navigate
+enum _sf_tx_power_t {
+	SF_TX14 = 14,
+  SF_TX17 = 17
+};
+
+struct t_settings_ {
+  _dr_configured_t sf;  
+  _sf_tx_power_t tx_power;
+  int interval;
+} __attribute__ ((packed)); 
+typedef struct t_settings_ t_settings;
+
+t_settings settings = { .sf = LORAWAN_SF_DEFAULT, .tx_power = SF_TX14, .interval = DEFAULT_SEND_INTERVAL };
+
 // -----------------------------------------------------------------------------
 // Application
 // -----------------------------------------------------------------------------
 
 void buildPacket(uint8_t txBuffer[]); // needed for platformio
+
+void sf_update() {
+  if(settings.sf == DR_SF12) {
+    settings.sf = LORAWAN_SF_DEFAULT;
+
+    settings.tx_power = (settings.tx_power == SF_TX14) ? SF_TX17 : SF_TX14;
+  } else  
+    settings.sf = (_dr_configured_t) (settings.sf - (_dr_configured_t)1);
+
+  LMIC_setDrTxpow(settings.sf, settings.tx_power);
+}
+
+const char* sf_toString() {
+  switch(settings.sf) {
+    case DR_SF7: return "SF7";
+    case DR_SF8: return "SF8";
+    case DR_SF9: return "SF9";
+    case DR_SF10: return "SF10";
+    case DR_SF11: return "SF11";
+    case DR_SF12: return "SF12";
+    default:      return "SF??";
+  }
+
+  return "SF??";
+}
+
+void interval_update() {
+  settings.interval++;
+
+  if(settings.interval >= MAX_SEND_INTERVAL)
+    settings.interval = MIN_SEND_INTERVAL;
+}
 
 /**
  * If we have a valid position send it to the server.
@@ -66,11 +118,12 @@ bool trySend() {
   if (0 < gps_hdop() && gps_hdop() < 50 && gps_latitude() != 0 && gps_longitude() != 0 && gps_altitude() != 0)
   {
     char buffer[40];
-    snprintf(buffer, sizeof(buffer), "Latitude: %10.6f\n", gps_latitude());
+
+    snprintf(buffer, sizeof(buffer), "Lat: %10.6f  %s-%d\n", gps_latitude(), sf_toString(), (int) settings.tx_power);
     screen_print(buffer);
-    snprintf(buffer, sizeof(buffer), "Longitude: %10.6f\n", gps_longitude());
+    snprintf(buffer, sizeof(buffer), "Lon: %10.6f  Int: %ds\n", gps_longitude(), settings.interval * INTERVAL_STEP);
     screen_print(buffer);
-    snprintf(buffer, sizeof(buffer), "Error: %4.2fm\n", gps_hdop());
+    snprintf(buffer, sizeof(buffer), "Hdop: %4.2fm  Alt: %4.2fm\n", gps_hdop(), gps_altitude());
     screen_print(buffer);
 
     buildPacket(txBuffer);
@@ -90,93 +143,34 @@ bool trySend() {
   }
 }
 
-
-void doDeepSleep(uint64_t msecToWake)
-{
-    Serial.printf("Entering deep sleep for %llu seconds\n", msecToWake / 1000);
-
-    // not using wifi yet, but once we are this is needed to shutoff the radio hw
-    // esp_wifi_stop();
-
-    screen_off(); // datasheet says this will draw only 10ua
-    LMIC_shutdown(); // cleanly shutdown the radio
-    
-    if(axp192_found) {
-        // turn on after initial testing with real hardware
-        axp.setPowerOutPut(AXP192_LDO2, AXP202_OFF); // LORA radio
-        axp.setPowerOutPut(AXP192_LDO3, AXP202_OFF); // GPS main power
-    }
-
-    // FIXME - use an external 10k pulldown so we can leave the RTC peripherals powered off
-    // until then we need the following lines
-    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
-
-    // Only GPIOs which are have RTC functionality can be used in this bit map: 0,2,4,12-15,25-27,32-39.
-    uint64_t gpioMask = (1ULL << BUTTON_PIN);
-
-    // FIXME change polarity so we can wake on ANY_HIGH instead - that would allow us to use all three buttons (instead of just the first)
-    gpio_pullup_en((gpio_num_t) BUTTON_PIN);
-
-    esp_sleep_enable_ext1_wakeup(gpioMask, ESP_EXT1_WAKEUP_ALL_LOW);
-
-    esp_sleep_enable_timer_wakeup(msecToWake * 1000ULL); // call expects usecs
-    esp_deep_sleep_start();                              // TBD mA sleep current (battery)
-}
-
-
-void sleep() {
-#if SLEEP_BETWEEN_MESSAGES
-
-  // If the user has a screen, tell them we are about to sleep
-  if(ssd1306_found) {
-    // Show the going to sleep message on the screen
-    char buffer[20];
-    snprintf(buffer, sizeof(buffer), "Sleeping in %3.1fs\n", (MESSAGE_TO_SLEEP_DELAY / 1000.0));
-    screen_print(buffer);
-
-    // Wait for MESSAGE_TO_SLEEP_DELAY millis to sleep
-    delay(MESSAGE_TO_SLEEP_DELAY);
-
-    // Turn off screen
-    screen_off();
-    }
-
-  // Set the user button to wake the board
-  sleep_interrupt(BUTTON_PIN, LOW);
-
-  // We sleep for the interval between messages minus the current millis
-  // this way we distribute the messages evenly every SEND_INTERVAL millis
-  uint32_t sleep_for = (millis() < SEND_INTERVAL) ? SEND_INTERVAL - millis() : SEND_INTERVAL;
-  doDeepSleep(sleep_for);
-
-#endif
-}
-
-
-
-
+/**
+ * If we have a valid position send it to the server.
+ * @return true if we decided to send.
+ */
 void callback(uint8_t message) {
-  if (EV_JOINING == message) screen_print("Joining TTN...\n");
-  if (EV_JOINED == message) {
+  if (EV_JOINING == message)
+    screen_print("Joining TTN...\n");
+  else if (EV_JOINED == message)
     screen_print("TTN joined!\n");
-  }
-  if (EV_JOIN_FAILED == message) screen_print("TTN join failed\n");
-  if (EV_REJOIN_FAILED == message) screen_print("TTN rejoin failed\n");
-  if (EV_RESET == message) screen_print("Reset TTN connection\n");
-  if (EV_LINK_DEAD == message) screen_print("TTN link dead\n");
-  if (EV_ACK == message) screen_print("ACK received\n");
-  if (EV_PENDING == message) screen_print("Message discarded\n");
-  if (EV_QUEUED == message) screen_print("Message queued\n");
-
-  // We only want to say 'packetSent' for our packets (not packets needed for joining)
-  if (EV_TXCOMPLETE == message && packetQueued) {
+  else if (EV_JOIN_FAILED == message)
+    screen_print("TTN join failed\n");
+  else if (EV_REJOIN_FAILED == message)
+    screen_print("TTN rejoin failed\n");
+  else if (EV_RESET == message)
+    screen_print("Reset TTN connection\n");
+  else if (EV_LINK_DEAD == message)
+    screen_print("TTN link dead\n");
+  else if (EV_ACK == message)
+    screen_print("ACK received\n");
+  else if (EV_PENDING == message)
+    screen_print("Message discarded\n");
+  else if (EV_QUEUED == message)
+    screen_print("Message queued\n");
+  else if (EV_TXCOMPLETE == message && packetQueued) { // We only want to say 'packetSent' for our packets (not packets needed for joining)
     screen_print("Message sent\n");
     packetQueued = false;
     packetSent = true;
-  }
-
-  if (EV_RESPONSE == message) {
-
+  } else if (EV_RESPONSE == message) {
     screen_print("[TTN] Response: ");
 
     size_t len = ttn_response_len();
@@ -191,8 +185,6 @@ void callback(uint8_t message) {
     screen_print("\n");
   }
 }
-
-
 
 void scanI2Cdevice(void)
 {
@@ -277,6 +269,7 @@ void axp192Init() {
         }, FALLING);
 
         axp.adc1Enable(AXP202_BATT_CUR_ADC1, 1);
+
         axp.enableIRQ(AXP202_VBUS_REMOVED_IRQ | AXP202_VBUS_CONNECT_IRQ | AXP202_BATT_REMOVED_IRQ | AXP202_BATT_CONNECT_IRQ, 1);
         axp.clearIRQ();
 
@@ -287,7 +280,6 @@ void axp192Init() {
         Serial.println("AXP192 not found");
     }
 }
-
 
 // Perform power on init that we do on each wake from deep sleep
 void initDeepSleep() {
@@ -304,11 +296,108 @@ void initDeepSleep() {
     Serial.printf("booted, wake cause %d (boot count %d)\n", wakeCause, bootCount);
 }
 
+void doDeepSleep(uint64_t msecToWake)
+{
+    Serial.printf("Entering deep sleep for %llu seconds\n", msecToWake / 1000);
+
+    // not using wifi yet, but once we are this is needed to shutoff the radio hw
+    // esp_wifi_stop();
+
+    screen_off(); // datasheet says this will draw only 10ua
+    LMIC_shutdown(); // cleanly shutdown the radio
+    
+    if(axp192_found) {
+        // turn on after initial testing with real hardware
+        axp.setPowerOutPut(AXP192_LDO2, AXP202_OFF); // LORA radio
+        axp.setPowerOutPut(AXP192_LDO3, AXP202_OFF); // GPS main power
+    }
+
+    // FIXME - use an external 10k pulldown so we can leave the RTC peripherals powered off
+    // until then we need the following lines
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+
+    // Only GPIOs which are have RTC functionality can be used in this bit map: 0,2,4,12-15,25-27,32-39.
+    uint64_t gpioMask = (1ULL << BUTTON_PIN);
+
+    // FIXME change polarity so we can wake on ANY_HIGH instead - that would allow us to use all three buttons (instead of just the first)
+    gpio_pullup_en((gpio_num_t) BUTTON_PIN);
+
+    esp_sleep_enable_ext1_wakeup(gpioMask, ESP_EXT1_WAKEUP_ALL_LOW);
+
+    esp_sleep_enable_timer_wakeup(msecToWake * 1000ULL); // call expects usecs
+    esp_deep_sleep_start();                              // TBD mA sleep current (battery)
+}
+
+
+void sleep() {
+#if SLEEP_BETWEEN_MESSAGES
+
+  // If the user has a screen, tell them we are about to sleep
+  if(ssd1306_found) {
+    // Show the going to sleep message on the screen
+    char buffer[20];
+    snprintf(buffer, sizeof(buffer), "Sleeping in %3.1fs\n", (MESSAGE_TO_SLEEP_DELAY / 1000.0));
+    screen_print(buffer);
+
+    // Wait for MESSAGE_TO_SLEEP_DELAY millis to sleep
+    delay(MESSAGE_TO_SLEEP_DELAY);
+
+    // Turn off screen
+    screen_off();
+    }
+
+    // Set the user button to wake the board
+    sleep_interrupt(BUTTON_PIN, LOW);
+
+    // We sleep for the interval between messages minus the current millis
+    // this way we distribute the messages evenly every SEND_INTERVAL millis
+    uint32_t sendInterval = (settings.interval * INTERVAL_STEP * 1000);
+
+    uint32_t sleep_for = (millis() < sendInterval) ? sendInterval - millis() : sendInterval;
+    doDeepSleep(sleep_for);
+
+#endif
+}
+
+void loadSettings() {
+  Preferences prefs;
+  
+  bool b_exist = prefs.begin("settings", false);
+  size_t settingsLen = prefs.getBytesLength("settings");
+  
+  if((b_exist == false) || (settingsLen != sizeof(t_settings))) { 
+    prefs.clear();
+    prefs.putBytes("settings", (uint8_t*) &settings, sizeof(t_settings));
+  } else {
+    prefs.getBytes("settings", (uint8_t*) &settings, sizeof(t_settings));
+  }
+
+  prefs.end();
+}
+
+void saveSettings() {
+  Preferences prefs;
+  
+  prefs.begin("settings", false);
+  prefs.putBytes("settings", (uint8_t*) &settings, sizeof(t_settings));
+  prefs.end();
+}
+
+void eraseSettings() {
+  Preferences prefs;
+  
+  prefs.begin("settings", false);
+  prefs.clear();
+  prefs.end();
+}
+
 void setup() {
   // Debug
   #ifdef DEBUG_PORT
   DEBUG_PORT.begin(SERIAL_BAUD);
   #endif
+
+  loadSettings();
 
   initDeepSleep();
 
@@ -362,6 +451,10 @@ void setup() {
 }
 
 void loop() {
+  // Send every SEND_INTERVAL millis
+  static uint32_t last = 0;
+  static bool first = true;
+  
   gps_loop();
   ttn_loop();
   screen_loop();
@@ -373,36 +466,53 @@ void loop() {
 
   // if user presses button for more than 3 secs, discard our network prefs and reboot (FIXME, use a debounce lib instead of this boilerplate)
   static bool wasPressed = false;
-  static uint32_t minPressMs; // what tick should we call this press long enough
+  static uint32_t erasePressMs; // what tick should we call this press long enough
+  static uint32_t sfPressMs; 
+  static uint32_t intervalPressMs; 
+  uint32_t currentMs;
   if(!digitalRead(BUTTON_PIN)) {
     if(!wasPressed) { // just started a new press
       Serial.println("pressing");
       wasPressed = true;
-      minPressMs = millis() + 3000;
+      sfPressMs = millis() ;
+      intervalPressMs = sfPressMs + 3000;
+      erasePressMs = sfPressMs + 10000;
     } 
   } else if(wasPressed) {
     // we just did a release
     wasPressed = false;
-    if(millis() > minPressMs) {
-      // held long enough
+    currentMs = millis();
+    if(currentMs > erasePressMs) {
       screen_print("Erasing prefs");
       ttn_erase_prefs();
+      eraseSettings();
       delay(5000); // Give some time to read the screen
       ESP.restart();
+    } else if(currentMs > intervalPressMs) {
+      interval_update();
+      saveSettings();
+
+      char buffer[20];
+      snprintf(buffer, sizeof(buffer), "interval: %ds\n", settings.interval * INTERVAL_STEP);
+      screen_print(buffer);
+    } else if (currentMs > sfPressMs) {
+      sf_update();
+      saveSettings();
+
+      char buffer[30];
+      snprintf(buffer, sizeof(buffer), "spread factor:%s pwr:%d\n", sf_toString(), (int) settings.tx_power);
+      screen_print(buffer);
     }
   }
 
-  // Send every SEND_INTERVAL millis
-  static uint32_t last = 0;
-  static bool first = true;
-  if (0 == last || millis() - last > SEND_INTERVAL) {
+  if (0 == last || millis() - last > (settings.interval * INTERVAL_STEP * 1000)) {
     if (trySend()) {
       last = millis();
       first = false;
       Serial.println("TRANSMITTED");
     } else {
       if (first) {
-        screen_print("Waiting GPS lock\n");
+        screen_print("Wait GPS fix\n");
         first = false;
       }
 #ifdef GPS_WAIT_FOR_LOCK
